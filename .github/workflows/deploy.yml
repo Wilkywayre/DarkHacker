@@ -3,18 +3,43 @@ name: deploy
 # Manual only: Actions -> deploy -> Run workflow. Publishes the extension
 # to the Chrome Web Store via the CWS Publish API v2.
 #
-# Required repository secrets (Settings -> Secrets -> Actions):
-#   CWS_PUBLISHER_ID   publisher id, from publishers.list or the dev dashboard URL
-#   CWS_ITEM_ID        32-char store item id from the dev dashboard URL
-#   CWS_CLIENT_ID      Google Cloud OAuth client id (scope: .../auth/chromewebstore)
-#   CWS_CLIENT_SECRET  Google Cloud OAuth client secret
-#   CWS_REFRESH_TOKEN  OAuth refresh token from a one-time manual consent
+# Secrets come from Infisical (house pattern, same as home4pets), NOT from
+# GitHub Secrets. The job mints a GitHub OIDC token, logs into Infisical
+# with it, and fetches exactly these keys (project darkhacker, env prod):
+#   CWS_PUBLISHER_ID, CWS_ITEM_ID, CWS_CLIENT_ID, CWS_CLIENT_SECRET,
+#   CWS_REFRESH_TOKEN
 #
-# One-time consent to mint CWS_REFRESH_TOKEN (replace $CLIENT_ID):
-#   open https://accounts.google.com/o/oauth2/auth?response_type=code&scope=https://www.googleapis.com/auth/chromewebstore&client_id=$CLIENT_ID&redirect_uri=urn:ietf:wg:oauth:2.0:oob
-#   then exchange the code:
-#   curl -d "client_id=$CLIENT_ID&client_secret=$SECRET&code=$CODE&grant_type=authorization_code&redirect_uri=urn:ietf:wg:oauth:2.0:oob" \
-#     https://oauth2.googleapis.com/token
+# One-time setup (all manual, done once):
+#   1. Infisical (https://secrets.wilkywayre.com): create project
+#      `darkhacker`, environment `prod`, and store the 5 keys above at
+#      path /. How to mint the CWS values:
+#        - CWS_ITEM_ID: open the item in the Chrome Web Store developer
+#          dashboard (https://chrome.google.com/webstore/devconsole); the
+#          32-char id is in the item URL.
+#        - CWS_PUBLISHER_ID: same dashboard URL, or publishers.list via
+#          the CWS API.
+#        - CWS_CLIENT_ID / CWS_CLIENT_SECRET: Google Cloud Console ->
+#          your project -> APIs & Services -> enable "Chrome Web Store
+#          API" -> Credentials -> Create Credentials -> OAuth client ID
+#          (application type: Desktop) -> note id + secret. The OAuth
+#          consent screen must list scope
+#          https://www.googleapis.com/auth/chromewebstore, and the
+#          publishing Google account needs 2-step verification.
+#        - CWS_REFRESH_TOKEN: one-time consent in a browser (replace
+#          $CLIENT_ID with the id from above):
+#            https://accounts.google.com/o/oauth2/auth?response_type=code&scope=https://www.googleapis.com/auth/chromewebstore&client_id=$CLIENT_ID&redirect_uri=urn:ietf:wg:oauth:2.0:oob
+#          then exchange the resulting code:
+#            curl -d "client_id=$CLIENT_ID&client_secret=$SECRET&code=$CODE&grant_type=authorization_code&redirect_uri=urn:ietf:wg:oauth:2.0:oob" \
+#              https://oauth2.googleapis.com/token
+#          The response's refresh_token is CWS_REFRESH_TOKEN.
+#   2. Infisical: add an OIDC identity on the darkhacker project whose
+#      subject trusts `repo:Wilkywayre/DarkHacker:environment:production`.
+#   3. Below: fill in INFISICAL_IDENTITY_ID and INFISICAL_PROJECT_ID with
+#      the ids from step 1-2. Until then the workflow fails closed naming
+#      exactly what is missing.
+#
+# Runs on the self-hosted builder because Infisical is pinned to its LAN
+# address (runners never depend on public DNS for secrets.wilkywayre.com).
 
 on:
   workflow_dispatch:
@@ -24,9 +49,26 @@ on:
         type: boolean
         default: true
 
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: darkhacker-deploy
+  cancel-in-progress: false
+
+env:
+  INFISICAL_URL: https://secrets.wilkywayre.com
+  INFISICAL_RESOLVE: secrets.wilkywayre.com:443:192.168.1.69
+  # TODO(one-time setup): fill these in, see header comment.
+  INFISICAL_IDENTITY_ID: ""
+  INFISICAL_PROJECT_ID: ""
+  INFISICAL_ENVIRONMENT: prod
+
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, wilkywayre-builder]
+    environment: production
     steps:
       - uses: actions/checkout@v4
 
@@ -38,9 +80,8 @@ jobs:
           python3 - <<'EOF'
           import zipfile
           from pathlib import Path
-          root = Path(".")
           files = ["manifest.json", "DarkHacker.css", "LICENSE", "README.md"]
-          files += [str(p) for p in sorted((root / "images").rglob("*")) if p.is_file()]
+          files += [str(p) for p in sorted(Path("images").rglob("*")) if p.is_file()]
           with zipfile.ZipFile("darkhacker.zip", "w", zipfile.ZIP_DEFLATED) as zf:
               for f in files:
                   zf.write(f)
@@ -48,40 +89,73 @@ jobs:
           EOF
           unzip -l darkhacker.zip
 
+      - name: Fetch store secrets from Infisical
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$INFISICAL_IDENTITY_ID" || -z "$INFISICAL_PROJECT_ID" ]]; then
+            echo "Infisical OIDC not wired: set INFISICAL_IDENTITY_ID and INFISICAL_PROJECT_ID (see deploy.yml header)." >&2
+            exit 1
+          fi
+          audience="https://github.com/Wilkywayre"
+          oidc_url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$(printf '%s' "$audience" | jq -sRr @uri)"
+          github_jwt="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$oidc_url" | jq -er '.value')"
+          login_body="$(jq -nc \
+            --arg identityId "$INFISICAL_IDENTITY_ID" \
+            --arg jwt "$github_jwt" \
+            '{identityId: $identityId, jwt: $jwt}')"
+          access_token="$(curl --fail --silent --show-error \
+            --resolve "$INFISICAL_RESOLVE" \
+            --request POST "$INFISICAL_URL/api/v1/auth/oidc-auth/login" \
+            --header 'Content-Type: application/json' \
+            --data "$login_body" | jq -er '.accessToken')"
+          secrets_json="$(curl --fail --silent --show-error \
+            --resolve "$INFISICAL_RESOLVE" \
+            --header "Authorization: Bearer $access_token" \
+            --get "$INFISICAL_URL/api/v4/secrets" \
+            --data-urlencode "projectId=$INFISICAL_PROJECT_ID" \
+            --data-urlencode "environment=$INFISICAL_ENVIRONMENT" \
+            --data-urlencode 'secretPath=/' \
+            --data-urlencode 'viewSecretValue=true')"
+          if ! printf '%s' "$secrets_json" | jq -e '
+            [.secrets[].secretKey] | sort == [
+              "CWS_CLIENT_ID",
+              "CWS_CLIENT_SECRET",
+              "CWS_ITEM_ID",
+              "CWS_PUBLISHER_ID",
+              "CWS_REFRESH_TOKEN"
+            ]' >/dev/null; then
+            echo "Infisical secret key drift; actual sorted key names:" >&2
+            printf '%s' "$secrets_json" | jq -c '[.secrets[].secretKey] | sort' >&2
+            exit 1
+          fi
+          echo "$secrets_json" > "$RUNNER_TEMP/cws-secrets.json"
+
       - name: Upload and publish to Chrome Web Store
         if: ${{ inputs.dry_run == false }}
-        env:
-          CWS_PUBLISHER_ID: ${{ secrets.CWS_PUBLISHER_ID }}
-          CWS_ITEM_ID: ${{ secrets.CWS_ITEM_ID }}
-          CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
-          CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
-          CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
         run: |
           python3 - <<'EOF'
           import json
           import os
           import urllib.request
 
-          def need(name):
-              value = os.environ.get(name, "")
-              if not value:
-                  raise SystemExit(f"missing required secret: {name}")
-              return value
+          with open(os.environ["RUNNER_TEMP"] + "/cws-secrets.json") as fh:
+              secrets = {s["secretKey"]: s["secretValue"]
+                         for s in json.load(fh)["secrets"]}
 
-          publisher = need("CWS_PUBLISHER_ID")
-          item = need("CWS_ITEM_ID")
-          client_id = need("CWS_CLIENT_ID")
-          client_secret = need("CWS_CLIENT_SECRET")
-          refresh_token = need("CWS_REFRESH_TOKEN")
+          resource = f"publishers/{secrets['CWS_PUBLISHER_ID']}/items/{secrets['CWS_ITEM_ID']}"
 
           token_req = urllib.request.Request(
               "https://oauth2.googleapis.com/token",
-              data=f"client_id={client_id}&client_secret={client_secret}"
-                   f"&refresh_token={refresh_token}&grant_type=refresh_token".encode(),
+              data=f"client_id={secrets['CWS_CLIENT_ID']}"
+                   f"&client_secret={secrets['CWS_CLIENT_SECRET']}"
+                   f"&refresh_token={secrets['CWS_REFRESH_TOKEN']}"
+                   "&grant_type=refresh_token".encode(),
           )
           access = json.load(urllib.request.urlopen(token_req))["access_token"]
 
-          resource = f"publishers/{publisher}/items/{item}"
           blob = open("darkhacker.zip", "rb").read()
           upload_req = urllib.request.Request(
               f"https://chromewebstore.googleapis.com/upload/v2/{resource}",
