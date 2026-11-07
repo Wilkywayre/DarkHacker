@@ -2,6 +2,7 @@
     "name": "Dark Hacker News",
     "version": "0.1.2",
     "description": "Dark Mode For Hacker News",
+    "homepage_url": "https://github.com/Wilkywayre/DarkHacker",
     "permissions": [
         "https://news.ycombinator.com/*"
     ],
