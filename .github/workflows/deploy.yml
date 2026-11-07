@@ -31,10 +31,12 @@ name: deploy
 #          then exchange the resulting code:
 #            curl -d "client_id=$CLIENT_ID&client_secret=$SECRET&code=$CODE&grant_type=authorization_code&redirect_uri=urn:ietf:wg:oauth:2.0:oob" \
 #              https://oauth2.googleapis.com/token
-#          The response's refresh_token is CWS_REFRESH_TOKEN.
-#   2. Infisical: add an OIDC identity on the darkhacker project whose
-#      subject trusts `repo:Wilkywayre/DarkHacker:environment:production`.
-#   3. Below: fill in INFISICAL_IDENTITY_ID and INFISICAL_PROJECT_ID with
+ #   2. Infisical: add an OIDC identity on the darkhacker project with:
+ #        - issuer and discovery URL: https://token.actions.githubusercontent.com
+ #        - subject: repo:Wilkywayre@315470107/DarkHacker@166633134:environment:production
+ #        - audience: https://github.com/Wilkywayre
+ #        - project role: secret read access limited to the `prod` environment
+ #   3. Below: fill in INFISICAL_IDENTITY_ID and INFISICAL_PROJECT_ID with
 #      the ids from step 1-2. Until then the workflow fails closed naming
 #      exactly what is missing.
 #
